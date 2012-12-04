@@ -63,7 +63,7 @@ respond(Code) ->
     Resource = get(resource),
     EndTime = now(),
     case Code of
-        404 ->
+        N when N >= 400 ->
             {ok, ErrorHandler} = application:get_env(webmachine, error_handler),
             Reason = {none, none, []},
             {ErrorHTML,ReqState} = ErrorHandler:render_error(
