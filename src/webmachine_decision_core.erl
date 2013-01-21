@@ -69,7 +69,7 @@ respond(Code) ->
             {ErrorHTML,ReqState} = ErrorHandler:render_error(
                           Code, {webmachine_request,get(reqstate)}, Reason),
             put(reqstate, ReqState),
-            wrcall({set_resp_body, ErrorHTML});
+            wrcall({set_resp_body, encode_body(ErrorHTML)});
         304 ->
             wrcall({remove_resp_header, "Content-Type"}),
             case resource_call(generate_etag) of
