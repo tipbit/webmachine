@@ -602,11 +602,23 @@ encode_body(Body) ->
     Charsetter = 
     case resource_call(charsets_provided) of
         no_charset -> fun(X) -> X end;
-        CP -> hd([Fun || {CSet,Fun} <- CP, ChosenCSet =:= CSet])
+        CP ->
+            case [Fun || {CSet,Fun} <- CP, ChosenCSet =:= CSet] of
+                [] ->
+                    fun(X) -> X end;
+                [F | _] ->
+                    F
+            end
     end,
     ChosenEnc = wrcall({get_metadata, 'content-encoding'}),
-    Encoder = hd([Fun || {Enc,Fun} <- resource_call(encodings_provided),
-                         ChosenEnc =:= Enc]),
+    Encoder =
+        case [Fun || {Enc,Fun} <- resource_call(encodings_provided),
+                     ChosenEnc =:= Enc] of
+            [] ->
+                fun(X) -> X end;
+            [E | _] ->
+                E
+        end,
     case Body of
         {stream, StreamBody} ->
             {stream, make_encoder_stream(Encoder, Charsetter, StreamBody)};
