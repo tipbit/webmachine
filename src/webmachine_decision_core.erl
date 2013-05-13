@@ -32,7 +32,7 @@ handle_request(Resource, ReqState) ->
     try
         d(v3b13)
     catch
-        error:_ ->            
+        error:_ ->
             error_response(erlang:get_stacktrace())
     end.
 
@@ -58,8 +58,10 @@ d(DecisionID) ->
     put(decision, DecisionID),
     log_decision(DecisionID),
     decision(DecisionID).
-    
-respond(Code) ->
+
+respond(Code) when is_integer(Code) ->
+    respond({Code, undefined});
+respond({Code, _ReasonPhrase}=CodeAndReason) ->
     Resource = get(resource),
     EndTime = now(),
     case Code of
@@ -86,9 +88,9 @@ respond(Code) ->
         _ -> ignore
     end,
     put(code, Code),
-    wrcall({set_response_code, Code}),
+    wrcall({set_response_code, CodeAndReason}),
     resource_call(finish_request),
-    wrcall({send_response, Code}),
+    wrcall({send_response, CodeAndReason}),
     RMod = wrcall({get_metadata, 'resource_module'}),
     Notes = wrcall(notes),
     LogData0 = wrcall(log_data),
@@ -140,18 +142,9 @@ decision_flow(X, TestResult) when is_integer(X) ->
 decision_flow(X, _TestResult) when is_atom(X) -> d(X).
 
 do_log(LogData) ->
-    case application:get_env(webmachine, webmachine_logger_module) of
-        {ok, LoggerModule} -> LoggerModule:log_access(LogData);
-        _ -> nop
-    end,
-    case application:get_env(webmachine, enable_perf_logger) of
-        {ok, true} ->
-            webmachine_perf_logger:log(LogData);
-        _ ->
-            ignore
-    end.
+    webmachine_log:log_access(LogData).
 
-log_decision(DecisionID) -> 
+log_decision(DecisionID) ->
     Resource = get(resource),
     Resource:log_d(DecisionID).
 
@@ -178,8 +171,31 @@ decision(v3b10) ->
                    string:join([atom_to_list(M) || M <- Methods], ", ")}]}),
             respond(405)
     end;
-%% "Malformed?"
+
+%% "Content-MD5 present?"
 decision(v3b9) ->
+    decision_test(get_header_val("content-md5"), undefined, v3b9b, v3b9a);
+%% "Content-MD5 valid?"
+decision(v3b9a) ->
+    case resource_call(validate_content_checksum) of
+        {error, Reason} ->
+            error_response(Reason);
+        {halt, Code} ->
+            respond(Code);
+        not_validated ->
+            Checksum = base64:decode(get_header_val("content-md5")),
+            BodyHash = compute_body_md5(),
+            case BodyHash =:= Checksum of
+                true -> d(v3b9b);
+                _ ->
+                    error_response(400, <<"Content-MD5 header does not match request body.">>)
+            end;
+        false ->
+            error_response(400, <<"Content-MD5 header does not match request body.">>);
+        _ -> d(v3b9b)
+    end;
+%% "Malformed?"
+decision(v3b9b) ->
     decision_test(resource_call(malformed_request), true, 400, v3b8);
 %% "Authorized?"
 decision(v3b8) ->
@@ -207,7 +223,7 @@ decision(v3b4) ->
     decision_test(resource_call(valid_entity_length), true, v3b3, 413);
 %% "OPTIONS?"
 decision(v3b3) ->
-    case method() of 
+    case method() of
         'OPTIONS' ->
             Hdrs = resource_call(options),
             respond(200, Hdrs);
@@ -383,7 +399,7 @@ decision(v3l7) ->
 decision(v3l13) ->
     decision_test(get_header_val("if-modified-since"), undefined, v3m16, v3l14);
 %% "IMS is valid date?"
-decision(v3l14) -> 
+decision(v3l14) ->
     IMSDate = get_header_val("if-modified-since"),
     decision_test(webmachine_util:convert_request_date(IMSDate),
                   bad_date, v3m16, v3l15);
@@ -396,7 +412,7 @@ decision(v3l15) ->
                   true, v3m16, v3l17);
 %% "Last-Modified > IMS?"
 decision(v3l17) ->
-    ReqDate = get_header_val("if-modified-since"),    
+    ReqDate = get_header_val("if-modified-since"),
     ReqErlDate = webmachine_util:convert_request_date(ReqDate),
     ResErlDate = resource_call(last_modified),
     decision_test(ResErlDate =:= undefined orelse ResErlDate > ReqErlDate,
@@ -413,7 +429,11 @@ decision(v3m16) ->
 %% DELETE enacted immediately?
 %% Also where DELETE is forced.
 decision(v3m20) ->
-    decision_test(resource_call(delete_resource), true, v3m20b, 500);
+    Result = resource_call(delete_resource),
+    %% DELETE may have body and TCP connection will be closed unless body is read.
+    %% See mochiweb_request:should_close.
+    maybe_flush_body_stream(),
+    decision_test(Result, true, v3m20b, 500);
 decision(v3m20b) ->
     decision_test(resource_call(delete_completed), true, v3o20, 202);
 %% "Server allows POST to missing resource?"
@@ -456,7 +476,7 @@ decision(v3n11) ->
             end;
         _ ->
             case resource_call(process_post) of
-                true -> 
+                true ->
                     encode_body_if_set(),
                     stage1_ok;
                 {halt, Code} -> respond(Code);
@@ -500,7 +520,7 @@ decision(v3o16) ->
     decision_test(method(), 'PUT', v3o14, v3o18);
 %% Multiple representations?
 % (also where body generation for GET and HEAD is done)
-decision(v3o18) ->    
+decision(v3o18) ->
     BuildBody = case method() of
         'GET' -> true;
         'HEAD' -> true;
@@ -528,7 +548,7 @@ decision(v3o18) ->
                               calendar:universal_time_to_local_time(Exp))})
             end,
             F = hd([Fun || {Type,Fun} <- resource_call(content_types_provided),
-                           CT =:= Type]),
+                           CT =:= webmachine_util:format_content_type(Type)]),
             resource_call(F);
         false -> nop
     end,
@@ -599,7 +619,7 @@ encode_body_if_set() ->
 
 encode_body(Body) ->
     ChosenCSet = wrcall({get_metadata, 'chosen-charset'}),
-    Charsetter = 
+    Charsetter =
     case resource_call(charsets_provided) of
         no_charset -> fun(X) -> X end;
         CP ->
@@ -622,6 +642,15 @@ encode_body(Body) ->
     case Body of
         {stream, StreamBody} ->
             {stream, make_encoder_stream(Encoder, Charsetter, StreamBody)};
+        {known_length_stream, 0, _StreamBody} ->
+            {known_length_stream, 0, empty_stream()};
+        {known_length_stream, Size, StreamBody} ->
+            case method() of
+                'HEAD' ->
+                    {known_length_stream, Size, empty_stream()};
+                _ ->
+                    {known_length_stream, Size, make_encoder_stream(Encoder, Charsetter, StreamBody)}
+            end;
         {stream, Size, Fun} ->
             {stream, Size, make_size_encoder_stream(Encoder, Charsetter, Fun)};
         {writer, BodyFun} ->
@@ -629,6 +658,10 @@ encode_body(Body) ->
         _ ->
             Encoder(Charsetter(iolist_to_binary(Body)))
     end.
+
+%% @private
+empty_stream() ->
+    {<<>>, fun() -> {<<>>, done} end}.
 
 make_encoder_stream(Encoder, Charsetter, {Body, done}) ->
     {Encoder(Charsetter(Body)), done};
@@ -691,3 +724,32 @@ variances() ->
             end
     end,
     Accept ++ AcceptEncoding ++ AcceptCharset ++ resource_call(variances).
+
+compute_body_md5() ->
+    case wrcall({req_body, 52428800}) of
+        stream_conflict ->
+            compute_body_md5_stream();
+        Body ->
+            crypto:md5(Body)
+    end.
+
+compute_body_md5_stream() ->
+    MD5Ctx = crypto:md5_init(),
+    compute_body_md5_stream(MD5Ctx, wrcall({stream_req_body, 8192}), <<>>).
+
+compute_body_md5_stream(MD5, {Hunk, done}, Body) ->
+    %% Save the body so it can be retrieved later
+    put(reqstate, wrq:set_resp_body(Body, get(reqstate))),
+    crypto:md5_final(crypto:md5_update(MD5, Hunk));
+compute_body_md5_stream(MD5, {Hunk, Next}, Body) ->
+    compute_body_md5_stream(crypto:md5_update(MD5, Hunk), Next(), <<Body/binary, Hunk/binary>>).
+
+maybe_flush_body_stream() ->
+    maybe_flush_body_stream(wrcall({stream_req_body, 8192})).
+
+maybe_flush_body_stream(stream_conflict) ->
+    ok;
+maybe_flush_body_stream({_Hunk, done}) ->
+    ok;
+maybe_flush_body_stream({_Hunk, Next}) ->
+    maybe_flush_body_stream(Next()).
